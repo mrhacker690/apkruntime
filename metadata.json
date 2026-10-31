@@ -1,0 +1,6 @@
+{
+  "name": "APK Runtime Engine",
+  "description": "Independent, browser-based Android APK execution and analysis software with binary XML parser, DEX inspector, and runtime compatibility engine.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
