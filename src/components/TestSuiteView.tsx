@@ -63,7 +63,7 @@ export const TestSuiteView: React.FC = () => {
               {isRunning ? (
                 <>
                   <RotateCcw className="w-3.5 h-3.5 animate-spin" />
-                  <span>Running Tests ({completedCount}/8)...</span>
+                  <span>Running Tests ({completedCount})...</span>
                 </>
               ) : (
                 <>
@@ -80,7 +80,7 @@ export const TestSuiteView: React.FC = () => {
           <div>
             <span className="text-slate-500 text-[11px]">Total Tests</span>
             <div className="text-lg font-bold text-slate-900 dark:text-white tabular-nums">
-              8 Suites
+              {results.length} Suites
             </div>
           </div>
           <div>

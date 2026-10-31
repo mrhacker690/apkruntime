@@ -7,24 +7,27 @@ on:
     branches: [main, master]
 
 jobs:
-  build-and-test:
+  ci:
+    name: Build & Verify
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js Environment
-        uses: actions/setup-node@v4
+      - name: Setup Bun Environment
+        uses: oven-sh/setup-bun@v2
         with:
-          node-version: 20
-          cache: 'npm'
+          bun-version: 1.2.4
 
-      - name: Install Dependencies
-        run: npm ci
+      - name: Install Frozen Dependencies
+        run: bun install --frozen-lockfile
 
-      - name: Run Type Checking & Build
-        run: npm run build
+      - name: TypeScript Type Checking
+        run: bun run typecheck
 
-      - name: Verify Archive & Binary Parsing Tests
-        run: npm test || echo "Automated test assertions verified in browser test suite."
+      - name: Automated Unit & Regression Tests
+        run: bun run test
+
+      - name: Production Build Verification
+        run: bun run build

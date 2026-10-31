@@ -2,22 +2,24 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
  * APK Runtime Engine - Import Engine Component
- * Handles local APK/ZIP drag-and-drop, public GitHub release URL fetching, and sample fixtures.
+ * Handles local APK/ZIP drag-and-drop with pre-flight signature checks,
+ * public GitHub repository / release inspection via GitHub API, and synthetic test fixtures.
  */
 
 import React, { useState, useRef } from 'react';
 import {
   UploadCloud,
-  FileCode,
   Link2,
-  FolderArchive,
   ArrowRight,
   Sparkles,
   AlertCircle,
-  CheckCircle2,
-  Cpu,
+  FolderArchive,
+  Download,
+  X,
+  FileCode,
 } from 'lucide-react';
 import { SAMPLE_APKS, SampleApkDefinition } from '../runtime/apk-loader/sample-apks';
+import { ApkRuntimeService, GitHubAssetItem } from '../runtime/apk-loader/runtime-service';
 
 interface ImportZoneProps {
   onLoadApkBuffer: (buffer: Uint8Array, filename: string) => void;
@@ -38,6 +40,10 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
   const [remoteUrl, setRemoteUrl] = useState('');
   const [isFetchingUrl, setIsFetchingUrl] = useState(false);
   const [urlError, setUrlError] = useState<string | null>(null);
+  const [gitHubAssets, setGitHubAssets] = useState<GitHubAssetItem[]>([]);
+  const [showAssetPicker, setShowAssetPicker] = useState(false);
+  const [selectedRepoInfo, setSelectedRepoInfo] = useState('');
+  const abortControllerRef = useRef<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -49,11 +55,42 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
     setIsDragOver(false);
   };
 
+  /**
+   * Pre-flight validation of local files: checks extension, size, and ZIP signature (PK\x03\x04)
+   */
   const processFile = async (file: File) => {
+    setUrlError(null);
     const filename = file.name;
+    const lower = filename.toLowerCase();
+
+    if (!lower.endsWith('.apk') && !lower.endsWith('.zip')) {
+      setUrlError(`Invalid file type "${filename}". Expected an Android .apk package or .zip container.`);
+      return;
+    }
+
+    if (file.size < 22) {
+      setUrlError(`File "${filename}" is corrupted or empty (size ${file.size} bytes).`);
+      return;
+    }
+
+    if (file.size > 500 * 1024 * 1024) {
+      setUrlError(`File "${filename}" exceeds maximum allowable size of 500 MB.`);
+      return;
+    }
+
+    // Pre-flight check: read first 4 bytes to verify ZIP signature
+    const headerSlice = await file.slice(0, 4).arrayBuffer();
+    const headerBytes = new Uint8Array(headerSlice);
+    const isZip = headerBytes[0] === 0x50 && headerBytes[1] === 0x4b && headerBytes[2] === 0x03 && headerBytes[3] === 0x04;
+
+    if (!isZip) {
+      setUrlError(`Invalid file header for "${filename}". File does not begin with standard ZIP magic signature (PK\\x03\\x04).`);
+      return;
+    }
+
     const buffer = new Uint8Array(await file.arrayBuffer());
 
-    if (filename.toLowerCase().endsWith('.zip')) {
+    if (lower.endsWith('.zip')) {
       onLoadZipBuffer(buffer, filename);
     } else {
       onLoadApkBuffer(buffer, filename);
@@ -75,6 +112,8 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
       const file = e.target.files[0];
       await processFile(file);
     }
+    // Reset file input so re-selecting same file triggers change
+    if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
   const handleFetchUrl = async (e: React.FormEvent) => {
@@ -82,47 +121,83 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
     if (!remoteUrl.trim()) return;
 
     setUrlError(null);
+    setGitHubAssets([]);
+    setShowAssetPicker(false);
     setIsFetchingUrl(true);
 
+    const targetUrl = remoteUrl.trim();
+    const parsedGitHub = ApkRuntimeService.parseGitHubUrl(targetUrl);
+
+    // If it's a GitHub repository or release tag URL (not a direct asset download link)
+    if (parsedGitHub && !parsedGitHub.isDirectAsset) {
+      try {
+        const repoStr = `${parsedGitHub.owner}/${parsedGitHub.repo}${parsedGitHub.tag ? ` (${parsedGitHub.tag})` : ' (latest)'}`;
+        setSelectedRepoInfo(repoStr);
+
+        const assets = await ApkRuntimeService.fetchGitHubReleaseAssets(
+          parsedGitHub.owner,
+          parsedGitHub.repo,
+          parsedGitHub.tag
+        );
+
+        if (assets.length === 0) {
+          throw new Error(`Release found for ${repoStr}, but it contains no .apk or .zip assets.`);
+        }
+
+        if (assets.length === 1) {
+          // Exactly one asset: proceed to download it directly
+          await downloadAsset(assets[0].downloadUrl, assets[0].name);
+        } else {
+          // Multiple assets: show asset picker
+          setGitHubAssets(assets);
+          setShowAssetPicker(true);
+        }
+      } catch (err: unknown) {
+        setUrlError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setIsFetchingUrl(false);
+      }
+      return;
+    }
+
+    // Otherwise, direct download URL
+    await downloadAsset(targetUrl);
+    setIsFetchingUrl(false);
+  };
+
+  const downloadAsset = async (downloadUrl: string, assetName?: string) => {
+    setIsFetchingUrl(true);
+    setUrlError(null);
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     try {
-      let targetUrl = remoteUrl.trim();
-      // Auto-convert standard github release page URLs to raw asset download if possible
-      if (targetUrl.includes('github.com') && targetUrl.includes('/releases/tag/')) {
-        targetUrl = targetUrl.replace('/releases/tag/', '/releases/download/');
-      }
+      const result = await ApkRuntimeService.fetchApkFromUrl(
+        downloadUrl,
+        controller.signal
+      );
 
-      const res = await fetch(targetUrl, {
-        method: 'GET',
-        headers: { Accept: 'application/vnd.android.package-archive,application/octet-stream,*/*' },
-      });
-
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-      }
-
-      const buf = await res.arrayBuffer();
-      const filenameMatch = targetUrl.split('/').pop()?.split('?')[0] || 'remote_app.apk';
-      const cleanFilename = filenameMatch.endsWith('.apk') || filenameMatch.endsWith('.zip')
-        ? filenameMatch
-        : `${filenameMatch}.apk`;
-
-      const uint8 = new Uint8Array(buf);
-      if (cleanFilename.toLowerCase().endsWith('.zip')) {
-        onLoadZipBuffer(uint8, cleanFilename);
+      const filename = assetName || result.filename;
+      if (filename.toLowerCase().endsWith('.zip')) {
+        onLoadZipBuffer(result.data, filename);
       } else {
-        onLoadApkBuffer(uint8, cleanFilename);
+        onLoadApkBuffer(result.data, filename);
       }
       setRemoteUrl('');
+      setShowAssetPicker(false);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('Failed to fetch') || msg.includes('CORS') || msg.includes('NetworkError')) {
-        setUrlError(
-          'Browser CORS restriction prevented fetching directly. GitHub raw release URLs usually require direct download. Please download the file to your computer and drag it into the box below.'
-        );
-      } else {
-        setUrlError(`Download failed: ${msg}`);
-      }
+      setUrlError(msg);
     } finally {
+      setIsFetchingUrl(false);
+      abortControllerRef.current = null;
+    }
+  };
+
+  const cancelDownload = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
       setIsFetchingUrl(false);
     }
   };
@@ -137,10 +212,10 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
       {/* Hero Title & Subtitle */}
       <div className="text-center max-w-3xl mx-auto pt-4 pb-2">
         <h1 className="text-3xl sm:text-4xl font-extrabold tracking-tight text-slate-900 dark:text-white" style={{ textWrap: 'balance' }}>
-          Run Android Apps in Your Browser
+          Android APK Analysis Engine
         </h1>
         <p className="mt-3 text-base text-slate-600 dark:text-slate-400 max-w-2xl mx-auto" style={{ textWrap: 'balance' }}>
-          Independent, browser-based Android execution environment. Ingest real APK files, inspect binary manifests, disassemble Dalvik bytecode, and evaluate compatibility without cloud servers.
+          Independent, browser-based Android APK inspection software. Ingest real APK archives, decode binary XML manifests, disassemble Dalvik bytecode, and inspect ELF native libraries without cloud servers.
         </p>
       </div>
 
@@ -203,11 +278,64 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
                 />
               </div>
             )}
+            {isFetchingUrl && (
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); cancelDownload(); }}
+                className="mt-4 px-3 py-1.5 text-xs text-rose-600 dark:text-rose-400 border border-rose-300 dark:border-rose-800 rounded-lg hover:bg-rose-50"
+              >
+                Cancel Download
+              </button>
+            )}
           </div>
         )}
       </div>
 
-      {/* Secondary Import Row: Remote GitHub Release URL & Pre-packaged Samples */}
+      {/* GitHub Asset Selector Modal/Box if release returned multiple files */}
+      {showAssetPicker && gitHubAssets.length > 0 && (
+        <div className="p-5 rounded-2xl border border-indigo-200 dark:border-indigo-900 bg-indigo-50/40 dark:bg-indigo-950/30 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2 text-xs font-bold text-slate-900 dark:text-white">
+              <FolderArchive className="w-4 h-4 text-indigo-500" />
+              <span>Select APK Asset from Release ({selectedRepoInfo})</span>
+            </div>
+            <button
+              onClick={() => setShowAssetPicker(false)}
+              className="text-slate-400 hover:text-slate-600 dark:hover:text-white"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          <div className="space-y-2">
+            {gitHubAssets.map(asset => (
+              <div
+                key={asset.id}
+                className="p-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 flex items-center justify-between gap-4"
+              >
+                <div>
+                  <div className="text-xs font-mono font-bold text-slate-900 dark:text-white">
+                    {asset.name}
+                  </div>
+                  <div className="text-[11px] text-slate-500 font-mono tabular-nums">
+                    {(asset.size / 1024 / 1024).toFixed(2)} MB
+                  </div>
+                </div>
+
+                <button
+                  onClick={() => downloadAsset(asset.downloadUrl, asset.name)}
+                  className="px-3 py-1.5 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg transition-colors flex items-center gap-1.5"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Download & Inspect</span>
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Secondary Import Row: Remote GitHub Release URL & Synthetic Fixtures */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* GitHub / Remote APK URL */}
         <div className="lg:col-span-5 p-5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
@@ -216,13 +344,13 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
             <span>Import from Public GitHub Release</span>
           </div>
           <p className="text-xs text-slate-500 dark:text-slate-400 mb-3">
-            Enter direct link to a public <span className="font-mono">.apk</span> release asset
+            Enter repository (e.g. <span className="font-mono">owner/repo</span>) or release asset link
           </p>
 
           <form onSubmit={handleFetchUrl} className="flex gap-2">
             <input
-              type="url"
-              placeholder="https://github.com/.../release.apk"
+              type="text"
+              placeholder="https://github.com/owner/repo/releases/..."
               value={remoteUrl}
               onChange={e => setRemoteUrl(e.target.value)}
               disabled={isFetchingUrl}
@@ -233,7 +361,7 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
               disabled={isFetchingUrl || !remoteUrl.trim()}
               className="px-3.5 py-2 text-xs font-semibold text-white bg-slate-900 dark:bg-slate-800 hover:bg-slate-800 dark:hover:bg-slate-700 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap shrink-0 flex items-center gap-1.5"
             >
-              <span>Fetch</span>
+              <span>Inspect</span>
               <ArrowRight className="w-3.5 h-3.5" />
             </button>
           </form>
@@ -241,19 +369,19 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
           {urlError && (
             <div className="mt-3 p-3 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/50 flex gap-2 text-xs text-amber-800 dark:text-amber-300">
               <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600 dark:text-amber-400" />
-              <span>{urlError}</span>
+              <span className="leading-relaxed">{urlError}</span>
             </div>
           )}
         </div>
 
-        {/* 1-Click Built-In Sample Test APKs */}
+        {/* Synthetic Test Fixtures (Task 3: Strictly labeled as Synthetic Test Fixtures) */}
         <div className="lg:col-span-7 p-5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2 text-sm font-semibold text-slate-900 dark:text-white">
               <Sparkles className="w-4 h-4 text-cyan-500" />
-              <span>Instant Test APK Fixtures</span>
+              <span>Synthetic Test Fixtures (For Parser Verification)</span>
             </div>
-            <span className="text-xs text-slate-500 dark:text-slate-400">1-click validation</span>
+            <span className="text-[10px] text-slate-500 font-mono">Optional</span>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
@@ -277,14 +405,8 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
                 </p>
                 <div className="mt-2 flex items-center justify-between text-[10px] text-slate-500">
                   <span>{sample.category}</span>
-                  <span
-                    className={
-                      sample.expectedStatus === 'SUPPORTED'
-                        ? 'text-emerald-600 dark:text-emerald-400 font-semibold'
-                        : 'text-amber-600 dark:text-amber-400 font-semibold'
-                    }
-                  >
-                    {sample.expectedStatus}
+                  <span className="text-sky-600 dark:text-sky-400 font-semibold font-mono">
+                    SYNTHETIC FIXTURE
                   </span>
                 </div>
               </button>

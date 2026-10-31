@@ -47,13 +47,13 @@ export interface AndroidComponent {
 
 export interface AndroidManifestData {
   packageName: string;
-  versionCode: number;
-  versionName: string;
+  versionCode?: number;
+  versionName?: string;
   compileSdkVersion?: number;
-  minSdkVersion: number;
-  targetSdkVersion: number;
+  minSdkVersion?: number;
+  targetSdkVersion?: number;
   maxSdkVersion?: number;
-  appLabel: string;
+  appLabel?: string;
   appIcon?: string;
   theme?: string;
   launcherActivity?: string;

@@ -4,7 +4,7 @@
  * APK Runtime Engine - Master Application Shell
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import {
   ApkAnalysisReport,
   RuntimeLog,
@@ -23,9 +23,10 @@ import { TestSuiteView } from './components/TestSuiteView';
 import { DocumentationView } from './components/DocumentationView';
 import { RuntimeConsole } from './components/RuntimeConsole';
 import { ZipApkModal } from './components/ZipApkModal';
-import { AlertCircle, RotateCcw } from 'lucide-react';
+import { AlertCircle, Smartphone, Sparkles } from 'lucide-react';
 
 export default function App() {
+  // Start with clean dashboard (no auto-loaded samples) as mandated by Task 3
   const [report, setReport] = useState<ApkAnalysisReport | null>(null);
   const [activeTab, setActiveTab] = useState<ActiveTab>('overview');
   const [isLoading, setIsLoading] = useState(false);
@@ -34,9 +35,14 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [logs, setLogs] = useState<RuntimeLog[]>([]);
 
-  // Dark/Light Theme state
+  // Fixed theme initialization: checks localStorage and class, no unconditional "|| true"
   const [isDark, setIsDark] = useState<boolean>(() => {
-    return document.documentElement.classList.contains('dark') || true;
+    if (typeof window !== 'undefined') {
+      const stored = localStorage.getItem('apk_theme');
+      if (stored !== null) return stored === 'dark';
+      return document.documentElement.classList.contains('dark');
+    }
+    return true;
   });
 
   // ZIP modal state
@@ -50,8 +56,10 @@ export default function App() {
     setIsDark(nextDark);
     if (nextDark) {
       document.documentElement.classList.add('dark');
+      localStorage.setItem('apk_theme', 'dark');
     } else {
       document.documentElement.classList.remove('dark');
+      localStorage.setItem('apk_theme', 'light');
     }
   };
 
@@ -141,12 +149,11 @@ export default function App() {
     }
   };
 
-  // Pre-load default fixture on initial boot so dashboard is never empty
-  useEffect(() => {
-    const defaultSample = SAMPLE_APKS[0];
-    const bytes = defaultSample.generate();
-    handleProcessApkBuffer(bytes, defaultSample.name);
-  }, []);
+  const handleLoadSampleFixture = (fixtureIndex: number = 0) => {
+    const fixture = SAMPLE_APKS[fixtureIndex] || SAMPLE_APKS[0];
+    const bytes = fixture.generate();
+    handleProcessApkBuffer(bytes, fixture.name);
+  };
 
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex flex-col selection:bg-indigo-500 selection:text-white">
@@ -189,11 +196,33 @@ export default function App() {
               loadProgress={loadProgress}
             />
 
-            {report && (
+            {report ? (
               <OverviewCard
                 report={report}
                 onAddLog={addLog}
               />
+            ) : (
+              /* Clean Empty State as mandated by Task 3 */
+              <div className="p-8 rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-center space-y-3">
+                <div className="w-12 h-12 mx-auto rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-400 flex items-center justify-center">
+                  <Smartphone className="w-6 h-6" />
+                </div>
+                <h3 className="text-base font-bold text-slate-900 dark:text-white">
+                  No APK Archive Loaded
+                </h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400 max-w-md mx-auto">
+                  Upload an Android <span className="font-mono">.apk</span> package above, fetch from a public GitHub release, or run a synthetic test fixture to verify parser outputs.
+                </p>
+                <div className="pt-2">
+                  <button
+                    onClick={() => handleLoadSampleFixture(0)}
+                    className="px-3.5 py-2 text-xs font-semibold text-indigo-600 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-950/50 hover:bg-indigo-100 dark:hover:bg-indigo-900/60 rounded-lg transition-colors inline-flex items-center gap-1.5"
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>Analyze Synthetic Test Fixture (HelloAndroid.apk)</span>
+                  </button>
+                </div>
+              </div>
             )}
           </div>
         )}
@@ -226,7 +255,7 @@ export default function App() {
           <DocumentationView />
         )}
 
-        {/* Runtime Diagnostics Console (Always accessible at bottom) */}
+        {/* Runtime Diagnostics Console */}
         <RuntimeConsole
           logs={logs}
           onClearLogs={clearLogs}
@@ -242,7 +271,7 @@ export default function App() {
         zipName={pendingZipName}
       />
 
-      {/* Editorial Footer */}
+      {/* Editorial Footer (Strict Apache-2.0 Notice) */}
       <footer className="border-t border-slate-200 dark:border-slate-800/80 bg-white dark:bg-slate-950 py-6 text-xs text-slate-500">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-2">
@@ -252,13 +281,13 @@ export default function App() {
             <span aria-hidden="true">·</span>
             <span>Independent Browser-Based Android Execution</span>
             <span aria-hidden="true">·</span>
-            <span>Phase 1 Milestone</span>
+            <span>Phase 1 Analysis Foundation</span>
           </div>
 
           <div className="flex items-center gap-4 text-slate-500">
-            <span>Client-side WebAssembly & TS Runtime</span>
+            <span>Client-side WebAssembly & TS Engine</span>
             <span aria-hidden="true">·</span>
-            <span>MIT License</span>
+            <span>Apache-2.0 License</span>
           </div>
         </div>
       </footer>

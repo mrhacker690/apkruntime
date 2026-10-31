@@ -1,14 +1,14 @@
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
- * APK Runtime Engine - Binary Android XML (AXML / ResXMLTree) Parser
- * Decodes compiled AndroidManifest.xml into structured metadata and formatted XML.
+ * APK Runtime Engine - Hardened Binary Android XML (AXML / ResXMLTree) Parser
+ * Decodes compiled AndroidManifest.xml chunks, string pools, attributes, and namespaces
+ * with strict boundary checks, no invented defaults, and transparent resource reference preservation.
  */
 
 import { AndroidManifestData, AndroidActivity, AndroidComponent } from '../core/types';
 
 // Chunk Types
-const RES_NULL_TYPE = 0x0000;
 const RES_STRING_POOL_TYPE = 0x0001;
 const RES_XML_TYPE = 0x0003;
 const RES_XML_RESOURCE_MAP_TYPE = 0x0180;
@@ -34,26 +34,35 @@ const TYPE_INT_COLOR_RGB8 = 0x1d;
 const TYPE_INT_COLOR_ARGB4 = 0x1e;
 const TYPE_INT_COLOR_RGB4 = 0x1f;
 
+// Dimension & Fraction unit masks
+const COMPLEX_UNIT_SHIFT = 0;
+const COMPLEX_UNIT_MASK = 0x0f;
+const DIMENSION_UNITS = ['px', 'dp', 'sp', 'pt', 'in', 'mm'];
+const FRACTION_UNITS = ['%', '%p'];
+
 // Well-known Android resource attribute IDs
-const RES_ATTR_VERSION_CODE = 0x0101021b;
-const RES_ATTR_VERSION_NAME = 0x0101021c;
-const RES_ATTR_NAME = 0x01010003;
 const RES_ATTR_LABEL = 0x01010001;
 const RES_ATTR_ICON = 0x01010002;
-const RES_ATTR_MIN_SDK = 0x0101020c;
-const RES_ATTR_TARGET_SDK = 0x01010270;
-const RES_ATTR_MAX_SDK = 0x01010271;
+const RES_ATTR_NAME = 0x01010003;
 const RES_ATTR_EXPORTED = 0x01010010;
 const RES_ATTR_THEME = 0x01010000;
+const RES_ATTR_MIN_SDK = 0x0101020c;
+const RES_ATTR_VERSION_CODE = 0x0101021b;
+const RES_ATTR_VERSION_NAME = 0x0101021c;
+const RES_ATTR_TARGET_SDK = 0x01010270;
+const RES_ATTR_MAX_SDK = 0x01010271;
+const RES_ATTR_REQUIRED = 0x0101028e;
 
-interface ParsedAttribute {
+export interface ParsedAttribute {
   namespaceUri: string;
   name: string;
-  value: string | number | boolean;
+  rawValue: string;
+  typedValue: unknown;
+  dataType: number;
   resId?: number;
 }
 
-interface ParsedElement {
+export interface ParsedElement {
   tag: string;
   attributes: ParsedAttribute[];
   children: ParsedElement[];
@@ -67,25 +76,36 @@ export class AxmlParseError extends Error {
   }
 }
 
+/**
+ * Parses binary Android XML (AndroidManifest.xml).
+ * Strictly validates chunk headers, offsets, and data boundaries without arbitrary overflow allowances.
+ */
 export function parseBinaryAndroidManifest(buffer: Uint8Array): AndroidManifestData {
-  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-
-  if (buffer.byteLength < 8) {
-    throw new AxmlParseError('File too small to be a valid Android binary XML.');
+  if (!buffer || buffer.byteLength < 8) {
+    throw new AxmlParseError('File too small to be a valid Android binary XML (minimum 8 bytes required).');
   }
 
+  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
   const fileType = view.getUint16(0, true);
+
   if (fileType !== RES_XML_TYPE) {
     // If it's already plain text XML, handle as fallback
     const text = new TextDecoder('utf-8').decode(buffer);
     if (text.includes('<manifest') || text.includes('<?xml')) {
       return parsePlainTextManifest(text);
     }
-    throw new AxmlParseError(`Invalid AXML magic type: expected 0x0003, got 0x${fileType.toString(16)}`);
+    throw new AxmlParseError(`Invalid AXML magic type: expected 0x0003 (RES_XML_TYPE), got 0x${fileType.toString(16)}.`);
   }
 
   const headerSize = view.getUint16(2, true);
-  const fileSize = view.getUint32(4, true);
+  const declaredFileSize = view.getUint32(4, true);
+
+  if (headerSize < 8 || headerSize > buffer.byteLength) {
+    throw new AxmlParseError(`Invalid AXML header size (${headerSize}).`);
+  }
+
+  // Strict buffer boundary check: chunk stream must not extend beyond actual buffer
+  const maxReadableSize = Math.min(buffer.byteLength, declaredFileSize);
 
   let offset = headerSize;
   let stringPool: string[] = [];
@@ -94,15 +114,23 @@ export function parseBinaryAndroidManifest(buffer: Uint8Array): AndroidManifestD
   const rootElements: ParsedElement[] = [];
   const elementStack: ParsedElement[] = [];
 
-  while (offset < buffer.byteLength && offset < fileSize) {
-    if (offset + 8 > buffer.byteLength) break;
+  while (offset < maxReadableSize) {
+    if (offset + 8 > buffer.byteLength) {
+      throw new AxmlParseError(`Unexpected EOF at offset 0x${offset.toString(16)}: truncated chunk header.`);
+    }
 
     const chunkType = view.getUint16(offset, true);
     const chunkHeaderSize = view.getUint16(offset + 2, true);
     const chunkSize = view.getUint32(offset + 4, true);
 
-    if (chunkSize <= 0 || offset + chunkSize > buffer.byteLength + 1024) {
-      throw new AxmlParseError(`Corrupted chunk size (${chunkSize}) at offset 0x${offset.toString(16)}`);
+    if (chunkSize < 8) {
+      throw new AxmlParseError(`Corrupted chunk size (${chunkSize}) at offset 0x${offset.toString(16)}.`);
+    }
+
+    if (offset + chunkSize > buffer.byteLength) {
+      throw new AxmlParseError(
+        `Chunk 0x${chunkType.toString(16)} extends outside actual file buffer (offset: 0x${offset.toString(16)}, size: ${chunkSize}, buffer: ${buffer.byteLength}).`
+      );
     }
 
     switch (chunkType) {
@@ -112,29 +140,41 @@ export function parseBinaryAndroidManifest(buffer: Uint8Array): AndroidManifestD
       }
 
       case RES_XML_RESOURCE_MAP_TYPE: {
-        const idCount = (chunkSize - chunkHeaderSize) / 4;
+        if (chunkHeaderSize < 8 || chunkHeaderSize > chunkSize) {
+          throw new AxmlParseError(`Invalid resource map chunk header size (${chunkHeaderSize}).`);
+        }
+        const idCount = Math.floor((chunkSize - chunkHeaderSize) / 4);
         resourceIds = [];
         for (let i = 0; i < idCount; i++) {
-          resourceIds.push(view.getUint32(offset + chunkHeaderSize + i * 4, true));
+          const idOff = offset + chunkHeaderSize + i * 4;
+          resourceIds.push(view.getUint32(idOff, true));
         }
         break;
       }
 
       case RES_XML_START_ELEMENT_TYPE: {
-        const line = view.getUint32(offset + 8, true);
-        const comment = view.getUint32(offset + 12, true);
+        if (chunkSize < 36) {
+          throw new AxmlParseError(`Malformed start element chunk at offset 0x${offset.toString(16)} (size ${chunkSize} < 36).`);
+        }
+
         const nsIdx = view.getUint32(offset + 16, true);
         const nameIdx = view.getUint32(offset + 20, true);
         const attrStart = view.getUint16(offset + 24, true);
         const attrSize = view.getUint16(offset + 26, true);
         const attrCount = view.getUint16(offset + 28, true);
 
-        const tagName = getString(stringPool, nameIdx);
-        const attributes: ParsedAttribute[] = [];
+        const tagName = getStringFromPool(stringPool, nameIdx);
+        if (!tagName) {
+          throw new AxmlParseError(`Start element at 0x${offset.toString(16)} references invalid tag string index ${nameIdx}.`);
+        }
 
+        const attributes: ParsedAttribute[] = [];
         let attrOffset = offset + attrStart;
+
         for (let a = 0; a < attrCount; a++) {
-          if (attrOffset + 20 > buffer.byteLength) break;
+          if (attrOffset + 20 > offset + chunkSize || attrOffset + 20 > buffer.byteLength) {
+            throw new AxmlParseError(`Attribute ${a} in <${tagName}> exceeds element chunk boundaries.`);
+          }
 
           const attrNsIdx = view.getUint32(attrOffset, true);
           const attrNameIdx = view.getUint32(attrOffset + 4, true);
@@ -143,28 +183,19 @@ export function parseBinaryAndroidManifest(buffer: Uint8Array): AndroidManifestD
           const dataType = view.getUint8(attrOffset + 14);
           const dataVal = view.getUint32(attrOffset + 16, true);
 
-          const attrNs = getString(stringPool, attrNsIdx);
-          const attrName = getString(stringPool, attrNameIdx);
-          const rawVal = getString(stringPool, rawValIdx);
+          const attrNs = getStringFromPool(stringPool, attrNsIdx);
+          const attrName = getStringFromPool(stringPool, attrNameIdx);
+          const rawVal = getStringFromPool(stringPool, rawValIdx);
 
-          let attrValue: string | number | boolean = rawVal;
-
-          if (dataType === TYPE_STRING) {
-            attrValue = getString(stringPool, dataVal) || rawVal;
-          } else if (dataType === TYPE_INT_BOOLEAN) {
-            attrValue = dataVal !== 0;
-          } else if (dataType === TYPE_INT_DEC || dataType === TYPE_INT_HEX) {
-            attrValue = dataVal;
-          } else if (dataType === TYPE_REFERENCE) {
-            attrValue = `@0x${dataVal.toString(16)}`;
-          }
-
-          const resId = resourceIds[attrNameIdx];
+          const typedValue = decodeTypedValue(dataType, dataVal, stringPool, rawVal);
+          const resId = attrNameIdx < resourceIds.length ? resourceIds[attrNameIdx] : undefined;
 
           attributes.push({
             namespaceUri: attrNs,
             name: attrName,
-            value: attrValue,
+            rawValue: rawVal,
+            typedValue,
+            dataType,
             resId,
           });
 
@@ -198,7 +229,7 @@ export function parseBinaryAndroidManifest(buffer: Uint8Array): AndroidManifestD
       case RES_XML_END_NAMESPACE_TYPE:
       case RES_XML_CDATA_TYPE:
       default:
-        // Handled cleanly
+        // Well-formed XML tree skipping
         break;
     }
 
@@ -210,20 +241,100 @@ export function parseBinaryAndroidManifest(buffer: Uint8Array): AndroidManifestD
     throw new AxmlParseError('No root XML element found in manifest.');
   }
 
-  return extractManifestData(root);
+  return extractManifestMetadata(root);
 }
 
+/**
+ * Decodes Android typed values into appropriate JavaScript primitives or formatted references.
+ */
+function decodeTypedValue(
+  dataType: number,
+  dataVal: number,
+  stringPool: string[],
+  rawVal: string
+): unknown {
+  switch (dataType) {
+    case TYPE_NULL:
+      return null;
+
+    case TYPE_REFERENCE:
+      // Keep explicitly as resource reference without pretending to resolve it before resources.arsc
+      return `@0x${dataVal.toString(16).padStart(8, '0')}`;
+
+    case TYPE_ATTRIBUTE:
+      return `?0x${dataVal.toString(16).padStart(8, '0')}`;
+
+    case TYPE_STRING:
+      return getStringFromPool(stringPool, dataVal) || rawVal;
+
+    case TYPE_FLOAT: {
+      const floatView = new DataView(new ArrayBuffer(4));
+      floatView.setUint32(0, dataVal, true);
+      return floatView.getFloat32(0, true);
+    }
+
+    case TYPE_DIMENSION: {
+      const val = dataVal >> 8;
+      const unitIdx = (dataVal >> COMPLEX_UNIT_SHIFT) & COMPLEX_UNIT_MASK;
+      const unit = DIMENSION_UNITS[unitIdx] || '';
+      return `${val}${unit}`;
+    }
+
+    case TYPE_FRACTION: {
+      const val = (dataVal >> 8) / 100;
+      const unitIdx = (dataVal >> COMPLEX_UNIT_SHIFT) & COMPLEX_UNIT_MASK;
+      const unit = FRACTION_UNITS[unitIdx] || '';
+      return `${val}${unit}`;
+    }
+
+    case TYPE_INT_DEC:
+      return dataVal | 0; // Signed 32-bit int
+
+    case TYPE_INT_HEX:
+      return `0x${(dataVal >>> 0).toString(16)}`;
+
+    case TYPE_INT_BOOLEAN:
+      return dataVal !== 0;
+
+    case TYPE_INT_COLOR_ARGB8:
+    case TYPE_INT_COLOR_RGB8:
+    case TYPE_INT_COLOR_ARGB4:
+    case TYPE_INT_COLOR_RGB4:
+      return `#${(dataVal >>> 0).toString(16).padStart(8, '0')}`;
+
+    default:
+      return rawVal || `[TypedValue 0x${dataType.toString(16)}: 0x${dataVal.toString(16)}]`;
+  }
+}
+
+/**
+ * Parses and bounds-checks the ResStringPool chunk
+ */
 function parseStringPool(buffer: Uint8Array, offset: number, chunkSize: number): string[] {
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  const chunkEnd = offset + chunkSize;
+
+  if (chunkSize < 28) {
+    throw new AxmlParseError('String pool chunk is truncated (less than 28 bytes).');
+  }
+
   const stringCount = view.getUint32(offset + 8, true);
-  const styleCount = view.getUint32(offset + 12, true);
   const flags = view.getUint32(offset + 16, true);
   const stringsStart = view.getUint32(offset + 20, true);
   const isUtf8 = (flags & (1 << 8)) !== 0;
 
+  // Protect against uncontrolled allocations from malicious headers
+  if (stringCount > 100000) {
+    throw new AxmlParseError(`Declared string pool count (${stringCount}) exceeds maximum safety limit.`);
+  }
+
   const stringOffsets: number[] = [];
   const baseOffsets = offset + 28;
+
   for (let i = 0; i < stringCount; i++) {
+    if (baseOffsets + i * 4 + 4 > chunkEnd) {
+      throw new AxmlParseError(`String offset table truncated at index ${i}.`);
+    }
     stringOffsets.push(view.getUint32(baseOffsets + i * 4, true));
   }
 
@@ -232,62 +343,85 @@ function parseStringPool(buffer: Uint8Array, offset: number, chunkSize: number):
 
   for (let i = 0; i < stringCount; i++) {
     const strOffset = poolBase + stringOffsets[i];
-    if (strOffset >= buffer.byteLength) {
+    if (strOffset >= chunkEnd || strOffset < offset) {
       strings.push('');
       continue;
     }
 
     if (isUtf8) {
-      // UTF-8 string pool: 1 or 2 bytes char count, 1 or 2 bytes byte length, utf8 string, 0x00
+      // UTF-8 String decoding
       let cur = strOffset;
+      if (cur >= chunkEnd) { strings.push(''); continue; }
+
       // Skip char length
       if (buffer[cur] & 0x80) cur += 2;
       else cur += 1;
+
+      if (cur >= chunkEnd) { strings.push(''); continue; }
+
       // Read byte length
       let byteLen = buffer[cur];
       if (byteLen & 0x80) {
+        if (cur + 1 >= chunkEnd) { strings.push(''); continue; }
         byteLen = ((byteLen & 0x7f) << 8) | buffer[cur + 1];
         cur += 2;
       } else {
         cur += 1;
       }
 
+      if (cur + byteLen > chunkEnd) {
+        strings.push('');
+        continue;
+      }
+
       const strBytes = buffer.subarray(cur, cur + byteLen);
-      strings.push(new TextDecoder('utf-8').decode(strBytes));
+      strings.push(new TextDecoder('utf-8', { fatal: false }).decode(strBytes));
     } else {
-      // UTF-16LE string pool: 2 or 4 bytes char count, utf16le string, 0x0000
+      // UTF-16LE String decoding
       let cur = strOffset;
+      if (cur + 2 > chunkEnd) { strings.push(''); continue; }
+
       let charLen = view.getUint16(cur, true);
       cur += 2;
       if (charLen & 0x8000) {
+        if (cur + 2 > chunkEnd) { strings.push(''); continue; }
         charLen = ((charLen & 0x7fff) << 16) | view.getUint16(cur, true);
         cur += 2;
       }
 
       const byteLen = charLen * 2;
+      if (cur + byteLen > chunkEnd) {
+        strings.push('');
+        continue;
+      }
+
       const strBytes = buffer.subarray(cur, cur + byteLen);
-      strings.push(new TextDecoder('utf-16le').decode(strBytes));
+      strings.push(new TextDecoder('utf-16le', { fatal: false }).decode(strBytes));
     }
   }
 
   return strings;
 }
 
-function getString(pool: string[], index: number): string {
+function getStringFromPool(pool: string[], index: number): string {
   if (index >= 0 && index < pool.length) {
     return pool[index] ?? '';
   }
   return '';
 }
 
-function extractManifestData(root: ParsedElement): AndroidManifestData {
+/**
+ * Extracts structured manifest metadata without inventing fake defaults
+ */
+function extractManifestMetadata(root: ParsedElement): AndroidManifestData {
   let packageName = '';
-  let versionCode = 1;
-  let versionName = '1.0';
-  let minSdkVersion = 21;
-  let targetSdkVersion = 33;
+  let versionCode: number | undefined;
+  let versionName: string | undefined;
+  let compileSdkVersion: number | undefined;
+  let minSdkVersion: number | undefined;
+  let targetSdkVersion: number | undefined;
   let maxSdkVersion: number | undefined;
-  let appLabel = '';
+  let appLabel: string | undefined;
   let appIcon: string | undefined;
   let theme: string | undefined;
   let launcherActivity: string | undefined;
@@ -302,11 +436,19 @@ function extractManifestData(root: ParsedElement): AndroidManifestData {
   // Read manifest root attributes
   for (const attr of root.attributes) {
     if (attr.name === 'package') {
-      packageName = String(attr.value);
+      packageName = String(attr.typedValue || attr.rawValue);
     } else if (attr.name === 'versionCode' || attr.resId === RES_ATTR_VERSION_CODE) {
-      versionCode = Number(attr.value) || 1;
+      if (typeof attr.typedValue === 'number') {
+        versionCode = attr.typedValue;
+      } else if (attr.rawValue) {
+        versionCode = parseInt(attr.rawValue, 10);
+      }
     } else if (attr.name === 'versionName' || attr.resId === RES_ATTR_VERSION_NAME) {
-      versionName = String(attr.value);
+      versionName = String(attr.typedValue || attr.rawValue);
+    } else if (attr.name === 'compileSdkVersion') {
+      if (typeof attr.typedValue === 'number') {
+        compileSdkVersion = attr.typedValue;
+      }
     }
   }
 
@@ -315,54 +457,67 @@ function extractManifestData(root: ParsedElement): AndroidManifestData {
     if (child.tag === 'uses-sdk') {
       for (const attr of child.attributes) {
         if (attr.name === 'minSdkVersion' || attr.resId === RES_ATTR_MIN_SDK) {
-          minSdkVersion = Number(attr.value) || 21;
+          if (typeof attr.typedValue === 'number') minSdkVersion = attr.typedValue;
+          else if (attr.rawValue) minSdkVersion = parseInt(attr.rawValue, 10);
         } else if (attr.name === 'targetSdkVersion' || attr.resId === RES_ATTR_TARGET_SDK) {
-          targetSdkVersion = Number(attr.value) || 33;
+          if (typeof attr.typedValue === 'number') targetSdkVersion = attr.typedValue;
+          else if (attr.rawValue) targetSdkVersion = parseInt(attr.rawValue, 10);
         } else if (attr.name === 'maxSdkVersion' || attr.resId === RES_ATTR_MAX_SDK) {
-          maxSdkVersion = Number(attr.value);
+          if (typeof attr.typedValue === 'number') maxSdkVersion = attr.typedValue;
+          else if (attr.rawValue) maxSdkVersion = parseInt(attr.rawValue, 10);
         }
       }
     } else if (child.tag === 'uses-permission') {
       for (const attr of child.attributes) {
         if (attr.name === 'name' || attr.resId === RES_ATTR_NAME) {
-          permissions.push(String(attr.value));
+          const pName = String(attr.typedValue || attr.rawValue);
+          if (pName && !permissions.includes(pName)) {
+            permissions.push(pName);
+          }
         }
       }
     } else if (child.tag === 'uses-feature') {
       for (const attr of child.attributes) {
         if (attr.name === 'name' || attr.resId === RES_ATTR_NAME) {
-          features.push(String(attr.value));
+          const fName = String(attr.typedValue || attr.rawValue);
+          if (fName && !features.includes(fName)) {
+            features.push(fName);
+          }
         }
       }
     } else if (child.tag === 'application') {
       for (const attr of child.attributes) {
         if (attr.name === 'label' || attr.resId === RES_ATTR_LABEL) {
-          appLabel = String(attr.value);
+          appLabel = String(attr.typedValue || attr.rawValue);
         } else if (attr.name === 'icon' || attr.resId === RES_ATTR_ICON) {
-          appIcon = String(attr.value);
+          appIcon = String(attr.typedValue || attr.rawValue);
         } else if (attr.name === 'theme' || attr.resId === RES_ATTR_THEME) {
-          theme = String(attr.value);
+          theme = String(attr.typedValue || attr.rawValue);
         }
       }
 
       for (const appChild of child.children) {
-        if (appChild.tag === 'activity') {
+        if (appChild.tag === 'activity' || appChild.tag === 'activity-alias') {
           let actName = '';
           let isLauncher = false;
-          let exported = false;
-          let label = '';
+          let exported: boolean | undefined = undefined;
+          let label: string | undefined = undefined;
 
           for (const attr of appChild.attributes) {
             if (attr.name === 'name' || attr.resId === RES_ATTR_NAME) {
-              actName = String(attr.value);
+              actName = String(attr.typedValue || attr.rawValue);
             } else if (attr.name === 'exported' || attr.resId === RES_ATTR_EXPORTED) {
-              exported = Boolean(attr.value);
+              if (typeof attr.typedValue === 'boolean') {
+                exported = attr.typedValue;
+              } else if (typeof attr.typedValue === 'number') {
+                exported = attr.typedValue !== 0;
+              }
             } else if (attr.name === 'label' || attr.resId === RES_ATTR_LABEL) {
-              label = String(attr.value);
+              label = String(attr.typedValue || attr.rawValue);
             }
           }
 
-          // Check intent-filters for MAIN + LAUNCHER
+          // Inspect intent filters for MAIN + LAUNCHER
           for (const filter of appChild.children) {
             if (filter.tag === 'intent-filter') {
               let hasMain = false;
@@ -371,12 +526,14 @@ function extractManifestData(root: ParsedElement): AndroidManifestData {
               for (const filterChild of filter.children) {
                 if (filterChild.tag === 'action') {
                   const actAttr = filterChild.attributes.find(a => a.name === 'name' || a.resId === RES_ATTR_NAME);
-                  if (actAttr && (actAttr.value === 'android.intent.action.MAIN' || actAttr.value === 'MAIN')) {
+                  const val = String(actAttr?.typedValue || actAttr?.rawValue || '');
+                  if (val === 'android.intent.action.MAIN' || val === 'MAIN') {
                     hasMain = true;
                   }
                 } else if (filterChild.tag === 'category') {
                   const catAttr = filterChild.attributes.find(a => a.name === 'name' || a.resId === RES_ATTR_NAME);
-                  if (catAttr && (catAttr.value === 'android.intent.category.LAUNCHER' || catAttr.value === 'LAUNCHER')) {
+                  const val = String(catAttr?.typedValue || catAttr?.rawValue || '');
+                  if (val === 'android.intent.category.LAUNCHER' || val === 'LAUNCHER') {
                     hasLauncher = true;
                   }
                 }
@@ -391,43 +548,51 @@ function extractManifestData(root: ParsedElement): AndroidManifestData {
             }
           }
 
-          // Normalize relative activity names (e.g. .MainActivity -> com.example.MainActivity)
+          // Normalize relative activity paths
           if (actName.startsWith('.')) {
             actName = packageName + actName;
-          } else if (!actName.includes('.')) {
+          } else if (actName && !actName.includes('.')) {
             actName = packageName + '.' + actName;
           }
 
           activities.push({
-            name: actName,
+            name: actName || '(unnamed activity)',
             isLauncher,
             exported,
             label,
           });
         } else if (appChild.tag === 'service') {
           const nameAttr = appChild.attributes.find(a => a.name === 'name' || a.resId === RES_ATTR_NAME);
-          if (nameAttr) services.push({ name: String(nameAttr.value) });
+          const expAttr = appChild.attributes.find(a => a.name === 'exported' || a.resId === RES_ATTR_EXPORTED);
+          if (nameAttr) {
+            services.push({
+              name: String(nameAttr.typedValue || nameAttr.rawValue),
+              exported: typeof expAttr?.typedValue === 'boolean' ? expAttr.typedValue : undefined,
+            });
+          }
         } else if (appChild.tag === 'receiver') {
           const nameAttr = appChild.attributes.find(a => a.name === 'name' || a.resId === RES_ATTR_NAME);
-          if (nameAttr) receivers.push({ name: String(nameAttr.value) });
+          const expAttr = appChild.attributes.find(a => a.name === 'exported' || a.resId === RES_ATTR_EXPORTED);
+          if (nameAttr) {
+            receivers.push({
+              name: String(nameAttr.typedValue || nameAttr.rawValue),
+              exported: typeof expAttr?.typedValue === 'boolean' ? expAttr.typedValue : undefined,
+            });
+          }
         } else if (appChild.tag === 'provider') {
           const nameAttr = appChild.attributes.find(a => a.name === 'name' || a.resId === RES_ATTR_NAME);
-          if (nameAttr) providers.push({ name: String(nameAttr.value) });
+          if (nameAttr) {
+            providers.push({
+              name: String(nameAttr.typedValue || nameAttr.rawValue),
+            });
+          }
         }
       }
     }
   }
 
-  if (!appLabel && packageName) {
-    const parts = packageName.split('.');
-    appLabel = parts[parts.length - 1];
-    appLabel = appLabel.charAt(0).toUpperCase() + appLabel.slice(1);
-  }
-
-  if (!launcherActivity && activities.length > 0) {
-    launcherActivity = activities[0].name;
-    activities[0].isLauncher = true;
-  }
+  // If launcherActivity wasn't explicitly matched with action.MAIN + category.LAUNCHER, do NOT fake one!
+  // Represent as undefined if missing.
 
   const rawXml = formatElementAsXml(root, 0);
 
@@ -435,10 +600,11 @@ function extractManifestData(root: ParsedElement): AndroidManifestData {
     packageName: packageName || 'unknown.package',
     versionCode,
     versionName,
+    compileSdkVersion,
     minSdkVersion,
     targetSdkVersion,
     maxSdkVersion,
-    appLabel: appLabel || 'Android Application',
+    appLabel,
     appIcon,
     theme,
     launcherActivity,
@@ -455,7 +621,7 @@ function extractManifestData(root: ParsedElement): AndroidManifestData {
 function formatElementAsXml(elem: ParsedElement, indentLevel: number): string {
   const indent = '  '.repeat(indentLevel);
   let attrs = elem.attributes
-    .map(a => `${a.name}="${escapeXml(String(a.value))}"`)
+    .map(a => `${a.name}="${escapeXml(String(a.typedValue !== undefined && a.typedValue !== null ? a.typedValue : a.rawValue))}"`)
     .join(' ');
   if (attrs) attrs = ' ' + attrs;
 
@@ -486,9 +652,10 @@ function parsePlainTextManifest(xmlText: string): AndroidManifestData {
   const vNameMatch = xmlText.match(/versionName\s*=\s*["']([^"']+)["']/i);
   const minSdkMatch = xmlText.match(/minSdkVersion\s*=\s*["'](\d+)["']/i);
   const targetSdkMatch = xmlText.match(/targetSdkVersion\s*=\s*["'](\d+)["']/i);
+  const maxSdkMatch = xmlText.match(/maxSdkVersion\s*=\s*["'](\d+)["']/i);
   const labelMatch = xmlText.match(/android:label\s*=\s*["']([^"']+)["']/i);
 
-  const packageName = pkgMatch ? pkgMatch[1] : 'com.example.app';
+  const packageName = pkgMatch ? pkgMatch[1] : 'unknown.package';
   const activities: AndroidActivity[] = [];
   const actRegex = /<activity[^>]*android:name\s*=\s*["']([^"']+)["'][^>]*>/gi;
   let m: RegExpExecArray | null;
@@ -497,7 +664,7 @@ function parsePlainTextManifest(xmlText: string): AndroidManifestData {
     if (actName.startsWith('.')) actName = packageName + actName;
     activities.push({
       name: actName,
-      isLauncher: xmlText.includes('android.intent.category.LAUNCHER'),
+      isLauncher: xmlText.includes('android.intent.category.LAUNCHER') && xmlText.includes(actName),
     });
   }
 
@@ -507,14 +674,17 @@ function parsePlainTextManifest(xmlText: string): AndroidManifestData {
     permissions.push(m[1]);
   }
 
+  const launcherAct = activities.find(a => a.isLauncher)?.name;
+
   return {
     packageName,
-    versionCode: vCodeMatch ? parseInt(vCodeMatch[1], 10) : 1,
-    versionName: vNameMatch ? vNameMatch[1] : '1.0',
-    minSdkVersion: minSdkMatch ? parseInt(minSdkMatch[1], 10) : 21,
-    targetSdkVersion: targetSdkMatch ? parseInt(targetSdkMatch[1], 10) : 33,
-    appLabel: labelMatch ? labelMatch[1] : packageName,
-    launcherActivity: activities[0]?.name,
+    versionCode: vCodeMatch ? parseInt(vCodeMatch[1], 10) : undefined,
+    versionName: vNameMatch ? vNameMatch[1] : undefined,
+    minSdkVersion: minSdkMatch ? parseInt(minSdkMatch[1], 10) : undefined,
+    targetSdkVersion: targetSdkMatch ? parseInt(targetSdkMatch[1], 10) : undefined,
+    maxSdkVersion: maxSdkMatch ? parseInt(maxSdkMatch[1], 10) : undefined,
+    appLabel: labelMatch ? labelMatch[1] : undefined,
+    launcherActivity: launcherAct,
     activities,
     services: [],
     receivers: [],

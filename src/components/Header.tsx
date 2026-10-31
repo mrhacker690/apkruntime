@@ -160,7 +160,7 @@ export const Header: React.FC<HeaderProps> = ({
           </button>
 
           <a
-            href="https://github.com/google-ai-studio/apk-runtime-engine"
+            href="https://github.com/mrhacker690/apkruntime"
             target="_blank"
             rel="noreferrer"
             aria-label="View on GitHub"
