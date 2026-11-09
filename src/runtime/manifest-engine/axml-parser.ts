@@ -104,8 +104,15 @@ export function parseBinaryAndroidManifest(buffer: Uint8Array): AndroidManifestD
     throw new AxmlParseError(`Invalid AXML header size (${headerSize}).`);
   }
 
-  // Strict buffer boundary check: chunk stream must not extend beyond actual buffer
-  const maxReadableSize = Math.min(buffer.byteLength, declaredFileSize);
+  if (declaredFileSize < headerSize) {
+    throw new AxmlParseError(`Declared AXML file size (${declaredFileSize}) is smaller than header size (${headerSize}).`);
+  }
+
+  if (declaredFileSize > buffer.byteLength) {
+    throw new AxmlParseError(`Declared AXML file size (${declaredFileSize}) exceeds actual file buffer (${buffer.byteLength}).`);
+  }
+
+  const maxReadableSize = declaredFileSize;
 
   let offset = headerSize;
   let stringPool: string[] = [];

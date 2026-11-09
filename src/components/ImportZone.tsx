@@ -16,7 +16,6 @@ import {
   FolderArchive,
   Download,
   X,
-  FileCode,
 } from 'lucide-react';
 import { SAMPLE_APKS, SampleApkDefinition } from '../runtime/apk-loader/sample-apks';
 import { ApkRuntimeService, GitHubAssetItem } from '../runtime/apk-loader/runtime-service';
@@ -43,6 +42,11 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
   const [gitHubAssets, setGitHubAssets] = useState<GitHubAssetItem[]>([]);
   const [showAssetPicker, setShowAssetPicker] = useState(false);
   const [selectedRepoInfo, setSelectedRepoInfo] = useState('');
+  const [downloadProgress, setDownloadProgress] = useState<{
+    loaded: number;
+    total: number;
+    speedKbps?: number;
+  } | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -112,7 +116,6 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
       const file = e.target.files[0];
       await processFile(file);
     }
-    // Reset file input so re-selecting same file triggers change
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
@@ -124,11 +127,11 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
     setGitHubAssets([]);
     setShowAssetPicker(false);
     setIsFetchingUrl(true);
+    setDownloadProgress(null);
 
     const targetUrl = remoteUrl.trim();
     const parsedGitHub = ApkRuntimeService.parseGitHubUrl(targetUrl);
 
-    // If it's a GitHub repository or release tag URL (not a direct asset download link)
     if (parsedGitHub && !parsedGitHub.isDirectAsset) {
       try {
         const repoStr = `${parsedGitHub.owner}/${parsedGitHub.repo}${parsedGitHub.tag ? ` (${parsedGitHub.tag})` : ' (latest)'}`;
@@ -145,10 +148,8 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
         }
 
         if (assets.length === 1) {
-          // Exactly one asset: proceed to download it directly
           await downloadAsset(assets[0].downloadUrl, assets[0].name);
         } else {
-          // Multiple assets: show asset picker
           setGitHubAssets(assets);
           setShowAssetPicker(true);
         }
@@ -160,7 +161,6 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
       return;
     }
 
-    // Otherwise, direct download URL
     await downloadAsset(targetUrl);
     setIsFetchingUrl(false);
   };
@@ -168,14 +168,22 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
   const downloadAsset = async (downloadUrl: string, assetName?: string) => {
     setIsFetchingUrl(true);
     setUrlError(null);
+    setDownloadProgress(null);
 
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
+    const startTime = Date.now();
+
     try {
       const result = await ApkRuntimeService.fetchApkFromUrl(
         downloadUrl,
-        controller.signal
+        controller.signal,
+        (loaded, total) => {
+          const elapsedSec = (Date.now() - startTime) / 1000;
+          const speedKbps = elapsedSec > 0 ? (loaded / 1024) / elapsedSec : 0;
+          setDownloadProgress({ loaded, total, speedKbps });
+        }
       );
 
       const filename = assetName || result.filename;
@@ -191,6 +199,7 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
       setUrlError(msg);
     } finally {
       setIsFetchingUrl(false);
+      setDownloadProgress(null);
       abortControllerRef.current = null;
     }
   };
@@ -199,6 +208,7 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       setIsFetchingUrl(false);
+      setDownloadProgress(null);
     }
   };
 
@@ -263,14 +273,39 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
           </div>
         </div>
 
-        {/* Loading Overlay */}
+        {/* Loading & Progress Overlay */}
         {(isLoading || isFetchingUrl) && (
-          <div className="absolute inset-0 bg-white/90 dark:bg-slate-900/90 backdrop-blur-sm rounded-2xl flex flex-col items-center justify-center p-6 z-10">
+          <div className="absolute inset-0 bg-white/95 dark:bg-slate-900/95 backdrop-blur-sm rounded-2xl flex flex-col items-center justify-center p-6 z-10">
             <div className="w-10 h-10 border-3 border-indigo-600 border-t-transparent rounded-full animate-spin mb-4" />
             <p className="text-sm font-semibold text-slate-900 dark:text-white">
-              {loadingMessage || 'Processing Android archive...'}
+              {loadingMessage || (isFetchingUrl ? 'Downloading remote APK asset...' : 'Processing Android archive...')}
             </p>
-            {loadProgress !== undefined && loadProgress > 0 && (
+
+            {/* Real Progress Feedback */}
+            {downloadProgress && (
+              <div className="w-72 mt-3 space-y-2">
+                <div className="flex justify-between text-xs font-mono text-slate-600 dark:text-slate-400">
+                  <span>{(downloadProgress.loaded / 1024 / 1024).toFixed(2)} MB</span>
+                  <span>
+                    {downloadProgress.total > 0 && downloadProgress.total !== downloadProgress.loaded
+                      ? `${(downloadProgress.total / 1024 / 1024).toFixed(2)} MB (${Math.round((downloadProgress.loaded / downloadProgress.total) * 100)}%)`
+                      : downloadProgress.speedKbps
+                      ? `${(downloadProgress.speedKbps / 1024).toFixed(1)} MB/s`
+                      : 'Downloading...'}
+                  </span>
+                </div>
+                {downloadProgress.total > 0 && downloadProgress.total !== downloadProgress.loaded && (
+                  <div className="w-full bg-slate-200 dark:bg-slate-800 h-2 rounded-full overflow-hidden">
+                    <div
+                      className="bg-indigo-600 h-full transition-all duration-150"
+                      style={{ width: `${Math.min(100, Math.round((downloadProgress.loaded / downloadProgress.total) * 100))}%` }}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+
+            {loadProgress !== undefined && loadProgress > 0 && !downloadProgress && (
               <div className="w-64 bg-slate-200 dark:bg-slate-800 h-1.5 rounded-full mt-3 overflow-hidden">
                 <div
                   className="bg-indigo-600 h-full transition-all duration-200"
@@ -278,11 +313,12 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
                 />
               </div>
             )}
+
             {isFetchingUrl && (
               <button
                 type="button"
                 onClick={(e) => { e.stopPropagation(); cancelDownload(); }}
-                className="mt-4 px-3 py-1.5 text-xs text-rose-600 dark:text-rose-400 border border-rose-300 dark:border-rose-800 rounded-lg hover:bg-rose-50"
+                className="mt-4 px-3 py-1.5 text-xs text-rose-600 dark:text-rose-400 border border-rose-300 dark:border-rose-800 rounded-lg hover:bg-rose-50 dark:hover:bg-rose-950/30 font-semibold"
               >
                 Cancel Download
               </button>
@@ -291,7 +327,7 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
         )}
       </div>
 
-      {/* GitHub Asset Selector Modal/Box if release returned multiple files */}
+      {/* GitHub Asset Selector Modal */}
       {showAssetPicker && gitHubAssets.length > 0 && (
         <div className="p-5 rounded-2xl border border-indigo-200 dark:border-indigo-900 bg-indigo-50/40 dark:bg-indigo-950/30 space-y-3">
           <div className="flex items-center justify-between">
@@ -335,7 +371,7 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
         </div>
       )}
 
-      {/* Secondary Import Row: Remote GitHub Release URL & Synthetic Fixtures */}
+      {/* Secondary Import Row */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* GitHub / Remote APK URL */}
         <div className="lg:col-span-5 p-5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
@@ -374,7 +410,7 @@ export const ImportZone: React.FC<ImportZoneProps> = ({
           )}
         </div>
 
-        {/* Synthetic Test Fixtures (Task 3: Strictly labeled as Synthetic Test Fixtures) */}
+        {/* Synthetic Test Fixtures */}
         <div className="lg:col-span-7 p-5 rounded-xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2 text-sm font-semibold text-slate-900 dark:text-white">

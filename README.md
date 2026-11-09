@@ -11,35 +11,44 @@ The long-term objective is to execute compatible Android applications locally on
 
 ---
 
-## Current Status: Phase 1 (Analysis & Extraction Foundation)
+## Current Status: Phase 1 Release (Analysis, Extraction & Security Foundation)
 
-In accordance with our strict engineering constitution, **no application execution is claimed before the actual virtual machine exists**. 
+In accordance with our strict engineering constitution:
+
+```
+APPLICATION EXECUTION: NOT IMPLEMENTED
+APPLICATION STATUS: ANALYSIS ONLY
+RUNTIME ENGINE: Static Inspection Phase 1
+```
 
 Current engine state:
-- **Runtime Engine**: Phase 1 Complete (Analysis & Extraction Foundation)
+- **Runtime Engine**: Phase 1 Release (Analysis, Extraction & Security Foundation)
 - **Application Status**: ANALYSIS ONLY
 - **Bytecode Execution**: In Development (Scheduled for Phase 4)
 
 ### Implemented Phase 1 Capabilities
 
 1. **Local & Remote APK Ingestion**:
-   - Ingestion of local `.apk` packages and multi-APK `.zip` containers.
+   - Ingestion of local `.apk` packages and multi-APK `.zip` containers up to 500 MB.
    - Pre-flight validation of file signatures (verifies `PK\x03\x04` magic before full buffering).
-   - Public GitHub repository and release asset inspection via GitHub's public API, with streaming progress and cancellation.
-   - Optional synthetic test fixtures for independent parser verification.
+   - Public GitHub repository and release asset inspection via GitHub's public API, with streaming progress, real-time byte counters, and user cancellation via `AbortController`.
+   - Strictly enforced 250 MB download ceiling for remote imports.
+   - Optional synthetic test fixtures explicitly labeled for independent parser verification.
 
 2. **Hardened Client-Side ZIP Archive Parser**:
-   - End of Central Directory (EOCD) and Central Directory parsing.
+   - End of Central Directory (EOCD) with comment length verification and Central Directory parsing.
+   - Local file header verification matching central directory filenames, flags, and data descriptors.
    - Decompression of Stored (0) and DEFLATE (8) compression modes (fixed & dynamic Huffman blocks).
    - Strict IEEE 802.3 CRC-32 checksum calculation and verification against archive records.
    - Strict uncompressed size verification.
    - Zip-bomb defense: 500 MB total volume ceiling, 150 MB per-entry limit, 5,000 file count threshold, and compression ratio anomaly detection.
    - Path-traversal protection blocking leading slashes, drive letters, control characters, and `..` segments.
    - Duplicate entry and normalized filename collision detection.
-   - Explicit rejection of encrypted entries and ZIP64 archives.
+   - Explicit rejection of encrypted entries, multi-disk archives, and ZIP64 formats.
 
 3. **Binary Android XML (ResXMLTree) Decoder**:
-   - Parses compiled `AndroidManifest.xml` binary chunks without arbitrary buffer extensions.
+   - Parses compiled `AndroidManifest.xml` binary chunks with strict buffer boundary enforcement.
+   - Rejects declared file sizes smaller than headers or larger than actual file buffers.
    - Decodes String Pool (UTF-8 and UTF-16LE) and Resource Map tables.
    - Decodes typed values (integers, booleans, dimensions, fractions, IEEE-754 floats, colors).
    - Preserves resource references (`@0x...`) without falsely claiming they are resolved prior to `resources.arsc` parsing.
@@ -48,15 +57,24 @@ Current engine state:
 
 4. **Dalvik Executable (DEX) Parser & Disassembler**:
    - Validates DEX headers: magic (`dex\n`), versions (`035`, `037`, `038`, `039`), endian tag (`0x12345678`), and file boundaries.
-   - Calculates and compares Adler-32 checksums against header declarations.
-   - Decodes Modified UTF-8 (MUTF-8) strings including embedded nulls (`0xC0 0x80`) and surrogate pairs.
+   - Calculates and verifies 20-byte **SHA-1 signatures** over header bytes 32 through `fileSize`.
+   - Calculates and compares **Adler-32 checksums** over header bytes 12 through `fileSize`.
+   - Comprehensive **Version-Aware Opcode Metadata System** covering standard Dalvik instructions and DEX 038/039 instructions:
+     - `0xfa`: `invoke-polymorphic` (4 code units / 8 bytes)
+     - `0xfb`: `invoke-polymorphic/range` (4 code units / 8 bytes)
+     - `0xfc`: `invoke-custom` (3 code units / 6 bytes)
+     - `0xfd`: `invoke-custom/range` (3 code units / 6 bytes)
+     - `0xfe`: `const-method-handle` (2 code units / 4 bytes)
+     - `0xff`: `const-method-type` (2 code units / 4 bytes)
+     - Special switch payloads (`packed-switch-payload`, `sparse-switch-payload`, `fill-array-data-payload`)
+     - Unsupported/reserved opcode detection blocking invalid or guessed instruction decoding.
+   - Decodes Modified UTF-8 (MUTF-8) strings including embedded nulls (`0xC0 0x80`), surrogate pairs, and chunked string construction.
    - Implements bounds-checked ULEB128 and SLEB128 decoders with 5-byte overflow protection.
-   - Disassembles Dalvik bytecode instructions using verified opcode length tables without guessing instruction boundaries.
 
 5. **Native ELF Shared Library Inspector**:
    - Dissects `.so` files in `lib/` directory: ELF magic (`0x7F 'E' 'L' 'F'`), class (32/64-bit), endianness, and machine architectures (ARMv7, AArch64, x86, x86-64, RISC-V).
    - Compares ABI directory names against actual declared machine code to flag discrepancies.
-   - Enforces explicit resource budgets (up to 100 native libraries / 50 MB) and reports any skipped files.
+   - Enforces pre-extraction resource budgets (up to 100 native libraries / 50 MB) and reports any skipped files.
 
 6. **Evidence-Based Compatibility Engine**:
    - Transparently classifies all parsed applications as `ANALYSIS ONLY` (or `NOT SUPPORTED` if invalid).
@@ -68,9 +86,9 @@ Current engine state:
 
 | Phase | Milestone | Status | Description |
 | :--- | :--- | :--- | :--- |
-| **Phase 1** | **APK Loading, Extraction & Analysis** | **COMPLETED** | Hardened ZIP extractor, SHA-256, binary manifest decoder, DEX parser with Adler-32 verification, ELF inspector, automated test suite. |
+| **Phase 1** | **APK Loading, Extraction & Analysis** | **COMPLETED** | Hardened ZIP extractor, SHA-256, SHA-1 & Adler-32 verification, binary manifest decoder, DEX parser with version-aware opcode metadata system, ELF inspector, automated test suite. |
 | **Phase 2** | **Expanded Binary XML & Resources** | Next | Full `resources.arsc` chunk table decoding, layout XML decomposition (`res/layout/*.xml`), and localized string tables. |
-| **Phase 3** | **Complete DEX Instruction Decoder** | Planned | Comprehensive decoding of all 256 Dalvik opcodes, try/catch exception handlers, and line number debug info tables. |
+| **Phase 3** | **Complete DEX Instruction Decoder** | Planned | Comprehensive decoding of all Dalvik opcodes, try/catch exception handlers, and line number debug info tables. |
 | **Phase 4** | **Basic DEX Virtual Machine** | Core | Register-based virtual machine (v0–vN), stack frame allocation, method invocation dispatcher, and heap simulation. |
 | **Phase 5** | **Android API Compatibility Layer** | Planned | Initial subset of `java.lang`, `java.util`, `android.app`, `android.os`, `android.view`, `android.widget`. |
 | **Phase 6** | **Application Lifecycle Manager** | Planned | ActivityThread scheduling: `onCreate` -> `onStart` -> `onResume` -> `onPause` -> `onStop` -> `onDestroy`. |
@@ -118,13 +136,16 @@ bun run typecheck
 bun run build
 ```
 
-The test runner verifies:
-- SHA-256 NIST known-answer test vectors (empty, short, 56-byte multi-block, and Unicode).
+The test runner verifies 23 automated regression suites:
+- SHA-256 NIST known-answer test vectors (empty, short, 56-byte multi-block, and Web Crypto parity).
+- SHA-1 NIST known-answer test vectors (empty, "abc").
 - ZIP DEFLATE decompression, CRC-32 IEEE 802.3 verification, and corrupted entry rejection.
-- ZIP security defenses (directory traversal, absolute paths, duplicate entries, ZIP64 rejection).
-- Binary XML strict buffer boundary enforcement and uninvented metadata defaults.
+- ZIP security defenses (directory traversal, absolute paths, duplicate entries, ZIP64 rejection, EOCD comment signature verification, local header mismatches).
+- Binary XML strict buffer boundary enforcement, declared file size overflow rejection, and uninvented metadata defaults.
 - Dalvik DEX Adler-32 checksum verification and corrupted data rejection.
-- ULEB128 5-byte overflow protection and signed SLEB128 decoders.
+- Dalvik DEX SHA-1 signature verification over bytes 32 through `fileSize`.
+- Dalvik DEX version-aware opcode metadata system (0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff, switch payloads, version availability).
+- ULEB128 5-byte overflow & 32-bit uint overflow protection, signed SLEB128 decoders.
 - MUTF-8 embedded null (`0xC0 0x80`) decoding.
 - ELF machine architecture vs ABI directory mismatch detection.
 - Honest compatibility assessment enforcing `ANALYSIS ONLY` status in Phase 1.

@@ -7,6 +7,7 @@
  */
 
 import { adler32 } from '../dex-parser/dex-parser';
+import { pureJsSha1Bytes } from '../apk-extractor/sha1';
 
 export interface SampleApkDefinition {
   id: string;
@@ -186,7 +187,11 @@ export function createSampleDex(
   // 9. Write Class Data Item
   dexBuffer.set(classDataItem, classDataOff);
 
-  // 10. Adler32 Checksum
+  // 10. SHA-1 Signature (bytes 12..31 computed over bytes 32..EOF)
+  const sha1Bytes = pureJsSha1Bytes(dexBuffer.subarray(32));
+  dexBuffer.set(sha1Bytes, 12);
+
+  // 11. Adler32 Checksum (bytes 8..11 computed over bytes 12..EOF)
   const checksum = adler32(dexBuffer.subarray(12));
   view.setUint32(8, checksum, true);
 
@@ -332,11 +337,13 @@ export function createSampleAndroidManifest(
   ]));
 
   // <uses-sdk>
-  chunks.push(makeStartElement(2, [
-    { nameIdx: 12, valIdx: 0xffffffff, type: 16, val: minSdk },
-    { nameIdx: 13, valIdx: 0xffffffff, type: 16, val: targetSdk },
-  ]));
-  chunks.push(makeEndElement(2));
+  if (minSdk > 0 || targetSdk > 0) {
+    const sdkAttrs = [];
+    if (minSdk > 0) sdkAttrs.push({ nameIdx: 12, valIdx: 0xffffffff, type: 16, val: minSdk });
+    if (targetSdk > 0) sdkAttrs.push({ nameIdx: 13, valIdx: 0xffffffff, type: 16, val: targetSdk });
+    chunks.push(makeStartElement(2, sdkAttrs));
+    chunks.push(makeEndElement(2));
+  }
 
   // <uses-permission>
   chunks.push(makeStartElement(8, [

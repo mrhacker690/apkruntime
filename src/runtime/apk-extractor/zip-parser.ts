@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  * APK Runtime Engine - Browser-Native Hardened ZIP Archive Parser
  * Supports Stored (0) and Deflate (8) with robust validation, CRC-32 verification,
- * and comprehensive Zip-Bomb, ZIP64, Encryption, and Path-Traversal Defenses.
+ * and comprehensive Zip-Bomb, ZIP64, Encryption, Data Descriptor, and Path-Traversal Defenses.
  */
 
 import { inflateSync } from 'fflate';
@@ -13,6 +13,7 @@ import { calculateSha256 } from './sha256';
 const EOCD_SIGNATURE = 0x06054b50;
 const CENTRAL_DIR_SIGNATURE = 0x02014b50;
 const LOCAL_HEADER_SIGNATURE = 0x04034b50;
+const DATA_DESCRIPTOR_SIGNATURE = 0x08074b50;
 const ZIP64_EOCD_SIGNATURE = 0x06064b50;
 const ZIP64_LOCATOR_SIGNATURE = 0x07064b50;
 
@@ -109,15 +110,28 @@ export async function parseApkArchive(
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const sha256 = await calculateSha256(data);
 
-  // 1. Locate End of Central Directory (EOCD)
-  // EOCD record is minimum 22 bytes long and at most 65535 + 22 bytes from the end.
+  // 1. Locate End of Central Directory (EOCD) with comment length verification
   const minEocdOffset = Math.max(0, data.byteLength - 65557);
   let eocdOffset = -1;
 
   for (let i = data.byteLength - 22; i >= minEocdOffset; i--) {
     if (view.getUint32(i, true) === EOCD_SIGNATURE) {
-      eocdOffset = i;
-      break;
+      const commentLen = view.getUint16(i + 20, true);
+      // Verify that this signature candidate exactly matches the file length
+      if (i + 22 + commentLen === data.byteLength) {
+        eocdOffset = i;
+        break;
+      }
+    }
+  }
+
+  // Fallback scan if comment length was non-standard
+  if (eocdOffset === -1) {
+    for (let i = data.byteLength - 22; i >= minEocdOffset; i--) {
+      if (view.getUint32(i, true) === EOCD_SIGNATURE) {
+        eocdOffset = i;
+        break;
+      }
     }
   }
 
@@ -125,12 +139,17 @@ export async function parseApkArchive(
     throw new ZipParseError('Invalid APK archive: End of Central Directory (EOCD) record not found.');
   }
 
-  // 2. Reject ZIP64 explicitly
-  // Check for ZIP64 locator or 0xFFFF / 0xFFFFFFFF placeholder counts
+  // 2. Validate Multi-Disk & Reject ZIP64
+  const diskNumber = view.getUint16(eocdOffset + 4, true);
+  const startDisk = view.getUint16(eocdOffset + 6, true);
   const totalEntriesDisk = view.getUint16(eocdOffset + 8, true);
   const totalEntries = view.getUint16(eocdOffset + 10, true);
   const centralDirSize = view.getUint32(eocdOffset + 12, true);
   const centralDirOffset = view.getUint32(eocdOffset + 16, true);
+
+  if (diskNumber !== 0 || startDisk !== 0 || totalEntriesDisk !== totalEntries) {
+    throw new ZipSecurityError('Multi-disk ZIP archives are not supported in standard APK format.');
+  }
 
   if (
     totalEntries === 0xffff ||
@@ -144,7 +163,7 @@ export async function parseApkArchive(
   // Check if a ZIP64 locator signature precedes the EOCD
   if (eocdOffset >= 20) {
     const possibleZip64Locator = view.getUint32(eocdOffset - 20, true);
-    if (possibleZip64Locator === ZIP64_LOCATOR_SIGNATURE) {
+    if (possibleZip64Locator === ZIP64_LOCATOR_SIGNATURE || possibleZip64Locator === ZIP64_EOCD_SIGNATURE) {
       throw new ZipSecurityError('ZIP64 End of Central Directory Locator detected. ZIP64 APKs are not supported.');
     }
   }
@@ -278,7 +297,7 @@ export async function parseApkArchive(
 
 /**
  * Extracts, decompresses, and strictly verifies the raw bytes of a single ZipEntry from archive data.
- * Validates local header signatures, decompressed output size, and CRC-32 checksum.
+ * Validates local header signatures, local filename, decompressed output size, and CRC-32 checksum.
  */
 export async function extractZipEntryData(
   archiveData: Uint8Array,
@@ -296,6 +315,7 @@ export async function extractZipEntryData(
     throw new ZipParseError(`Invalid local header signature for "${entry.filename}": expected 0x04034b50, got 0x${sig.toString(16)}.`);
   }
 
+  const localFlags = view.getUint16(localOffset + 6, true);
   const localMethod = view.getUint16(localOffset + 8, true);
   if (localMethod !== entry.compressionMethod) {
     throw new ZipParseError(`Compression method mismatch between central directory (${entry.compressionMethod}) and local header (${localMethod}) for "${entry.filename}".`);
@@ -303,6 +323,20 @@ export async function extractZipEntryData(
 
   const filenameLength = view.getUint16(localOffset + 26, true);
   const extraLength = view.getUint16(localOffset + 28, true);
+
+  if (localOffset + 30 + filenameLength > archiveData.byteLength) {
+    throw new ZipParseError(`Local filename field out of bounds for "${entry.filename}".`);
+  }
+
+  const localRawName = new TextDecoder('utf-8').decode(
+    archiveData.subarray(localOffset + 30, localOffset + 30 + filenameLength)
+  );
+  const localSafeName = sanitizePath(localRawName);
+
+  if (localSafeName !== entry.filename) {
+    throw new ZipParseError(`Local filename "${localSafeName}" mismatches central directory entry "${entry.filename}".`);
+  }
+
   const dataStart = localOffset + 30 + filenameLength + extraLength;
   const dataEnd = dataStart + entry.compressedSize;
 
@@ -315,7 +349,7 @@ export async function extractZipEntryData(
 
   // Method 0: Stored (Uncompressed)
   if (entry.compressionMethod === 0) {
-    if (entry.compressedSize !== entry.uncompressedSize) {
+    if (entry.compressedSize !== entry.uncompressedSize && (localFlags & 0x0008) === 0) {
       throw new ZipParseError(`Stored entry "${entry.filename}" has mismatched compressed and uncompressed sizes.`);
     }
     decompressed = rawCompressedData;

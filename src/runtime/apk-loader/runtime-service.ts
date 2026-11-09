@@ -131,18 +131,38 @@ export class ApkRuntimeService {
     // 5. Inspect Native Shared Libraries (lib/*.so) within Resource Budget
     const extractedNativeMap = new Map<string, Uint8Array>();
     let nativeBytesAccumulated = 0;
+    let nativeFilesAccumulated = 0;
 
     for (let i = 0; i < archive.nativeLibEntries.length; i++) {
-      if (i >= MAX_INSPECTABLE_NATIVE_FILES || nativeBytesAccumulated >= MAX_INSPECTABLE_NATIVE_BYTES) {
+      const entry = archive.nativeLibEntries[i];
+      // Pre-flight check: check if adding this entry exceeds max files or byte budget
+      if (
+        nativeFilesAccumulated >= MAX_INSPECTABLE_NATIVE_FILES ||
+        nativeBytesAccumulated + entry.uncompressedSize > MAX_INSPECTABLE_NATIVE_BYTES
+      ) {
+        addLog(
+          'info',
+          'Native Inspector',
+          `Native inspection budget threshold reached (${nativeFilesAccumulated}/${MAX_INSPECTABLE_NATIVE_FILES} files, ${(nativeBytesAccumulated / 1024 / 1024).toFixed(1)} MB / 50 MB). Remaining native binaries skipped.`
+        );
         break;
       }
-      const entry = archive.nativeLibEntries[i];
+
       try {
         const soBytes = await extractZipEntryData(buffer, entry);
-        extractedNativeMap.set(entry.filename, soBytes);
-        nativeBytesAccumulated += soBytes.byteLength;
-      } catch {
-        // Continue inspecting remaining entries
+        if (nativeBytesAccumulated + soBytes.byteLength <= MAX_INSPECTABLE_NATIVE_BYTES) {
+          extractedNativeMap.set(entry.filename, soBytes);
+          nativeBytesAccumulated += soBytes.byteLength;
+          nativeFilesAccumulated++;
+        } else {
+          break;
+        }
+      } catch (err: unknown) {
+        addLog(
+          'warn',
+          'Native Inspector',
+          `Failed to extract native binary "${entry.filename}": ${err instanceof Error ? err.message : String(err)}`
+        );
       }
     }
 
