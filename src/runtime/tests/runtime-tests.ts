@@ -32,6 +32,7 @@ import {
   inspectNativeLibrariesDetailed,
 } from '../native-inspector/elf-inspector';
 import { evaluateCompatibility } from '../compatibility-engine/compatibility';
+import { ApkRuntimeService } from '../apk-loader/runtime-service';
 import {
   createSampleAndroidManifest,
   createSampleDex,
@@ -415,6 +416,42 @@ export async function runAllRuntimeTests(onProgress?: (result: TestCaseResult) =
     }
     if (result.readyForExecution !== false) {
       throw new Error('Expected readyForExecution to be false in Phase 1 release.');
+    }
+  });
+
+  // ==========================================
+  // MODULE 7: Remote Import & GitHub URL Security
+  // ==========================================
+
+  await runTest('t24-github-url-parser-security', 'Remote Importer: Strict GitHub URL Hostname & Security Validation', 'Remote Importer', () => {
+    // 1. Valid repository URL
+    const res1 = ApkRuntimeService.parseGitHubUrl('https://github.com/mrhacker690/apkruntime');
+    if (!res1 || res1.owner !== 'mrhacker690' || res1.repo !== 'apkruntime' || res1.isDirectAsset !== false) {
+      throw new Error(`Failed to parse valid repository URL: ${JSON.stringify(res1)}`);
+    }
+
+    // 2. Valid direct release asset URL
+    const res2 = ApkRuntimeService.parseGitHubUrl('https://github.com/owner/repo/releases/download/v1.0.0/app.apk');
+    if (!res2 || res2.owner !== 'owner' || res2.repo !== 'repo' || res2.tag !== 'v1.0.0' || res2.isDirectAsset !== true) {
+      throw new Error(`Failed to parse valid direct release asset URL: ${JSON.stringify(res2)}`);
+    }
+
+    // 3. Reject lookalike domain (evilgithub.com)
+    const res3 = ApkRuntimeService.parseGitHubUrl('https://evilgithub.com/owner/repo');
+    if (res3 !== null) {
+      throw new Error('Lookalike domain evilgithub.com was not rejected.');
+    }
+
+    // 4. Reject lookalike subdomain (github.com.attacker.org)
+    const res4 = ApkRuntimeService.parseGitHubUrl('https://github.com.attacker.org/owner/repo');
+    if (res4 !== null) {
+      throw new Error('Subdomain trick github.com.attacker.org was not rejected.');
+    }
+
+    // 5. Reject URL with embedded credentials (user:pass@github.com)
+    const res5 = ApkRuntimeService.parseGitHubUrl('https://user:pass@github.com/owner/repo');
+    if (res5 !== null) {
+      throw new Error('URL with embedded credentials was not rejected.');
     }
   });
 

@@ -240,25 +240,49 @@ export class ApkRuntimeService {
     isDirectAsset: boolean;
   } | null {
     const clean = rawUrl.trim();
-    // Example: https://github.com/owner/repo/releases/download/v1.0.0/app.apk
-    const downloadMatch = clean.match(/github\.com\/([^/]+)\/([^/]+)\/releases\/download\/([^/]+)\/(.+)/i);
-    if (downloadMatch) {
-      return { owner: downloadMatch[1], repo: downloadMatch[2], tag: downloadMatch[3], isDirectAsset: true };
+    if (!clean) return null;
+
+    let parsedUrl: URL;
+    try {
+      const urlToParse = /^https?:\/\//i.test(clean) ? clean : `https://${clean}`;
+      parsedUrl = new URL(urlToParse);
+    } catch {
+      return null;
     }
 
-    // Example: https://github.com/owner/repo/releases/tag/v1.0.0
-    const tagMatch = clean.match(/github\.com\/([^/]+)\/([^/]+)\/releases\/tag\/([^/?#]+)/i);
-    if (tagMatch) {
-      return { owner: tagMatch[1], repo: tagMatch[2], tag: tagMatch[3], isDirectAsset: false };
+    // Require HTTPS, exact hostname 'github.com' (no lookalike domains or user credentials)
+    if (parsedUrl.protocol !== 'https:' || parsedUrl.hostname.toLowerCase() !== 'github.com') {
+      return null;
+    }
+    if (parsedUrl.username || parsedUrl.password) {
+      return null;
     }
 
-    // Example: https://github.com/owner/repo/releases or https://github.com/owner/repo
-    const repoMatch = clean.match(/github\.com\/([^/]+)\/([^/?#]+)/i);
-    if (repoMatch) {
-      return { owner: repoMatch[1], repo: repoMatch[2], isDirectAsset: false };
+    const pathSegments = parsedUrl.pathname.split('/').filter(Boolean);
+    if (pathSegments.length < 2) return null;
+
+    const owner = pathSegments[0];
+    const repo = pathSegments[1].replace(/\.git$/i, '');
+
+    // Owner and repo syntax validation
+    if (!/^[a-zA-Z0-9_-]+$/.test(owner) || !/^[a-zA-Z0-9._-]+$/.test(repo)) {
+      return null;
     }
 
-    return null;
+    // Direct asset download link: /owner/repo/releases/download/v1.0.0/app.apk
+    if (pathSegments.length >= 5 && pathSegments[2].toLowerCase() === 'releases' && pathSegments[3].toLowerCase() === 'download') {
+      const tag = pathSegments[4];
+      return { owner, repo, tag, isDirectAsset: true };
+    }
+
+    // Tag link: /owner/repo/releases/tag/v1.0.0
+    if (pathSegments.length >= 4 && pathSegments[2].toLowerCase() === 'releases' && pathSegments[3].toLowerCase() === 'tag') {
+      const tag = pathSegments[4];
+      return { owner, repo, tag, isDirectAsset: false };
+    }
+
+    // Repo root or releases page: /owner/repo or /owner/repo/releases
+    return { owner, repo, isDirectAsset: false };
   }
 
   /**

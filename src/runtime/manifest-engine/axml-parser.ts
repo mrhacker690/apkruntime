@@ -228,6 +228,9 @@ export function parseBinaryAndroidManifest(buffer: Uint8Array): AndroidManifestD
       }
 
       case RES_XML_END_ELEMENT_TYPE: {
+        if (elementStack.length === 0) {
+          throw new AxmlParseError(`Unexpected end element chunk at offset 0x${offset.toString(16)} with empty element stack.`);
+        }
         elementStack.pop();
         break;
       }
@@ -241,6 +244,10 @@ export function parseBinaryAndroidManifest(buffer: Uint8Array): AndroidManifestD
     }
 
     offset += chunkSize;
+  }
+
+  if (elementStack.length > 0) {
+    throw new AxmlParseError(`Binary XML ended with ${elementStack.length} unclosed XML element(s).`);
   }
 
   const root = rootElements[0];
@@ -351,25 +358,30 @@ function parseStringPool(buffer: Uint8Array, offset: number, chunkSize: number):
   for (let i = 0; i < stringCount; i++) {
     const strOffset = poolBase + stringOffsets[i];
     if (strOffset >= chunkEnd || strOffset < offset) {
-      strings.push('');
-      continue;
+      throw new AxmlParseError(`String #${i} offset (0x${strOffset.toString(16)}) is outside string pool boundary (0x${offset.toString(16)}..0x${chunkEnd.toString(16)}).`);
     }
 
     if (isUtf8) {
       // UTF-8 String decoding
       let cur = strOffset;
-      if (cur >= chunkEnd) { strings.push(''); continue; }
+      if (cur >= chunkEnd) {
+        throw new AxmlParseError(`UTF-8 String #${i} extends past string pool chunk boundary.`);
+      }
 
       // Skip char length
       if (buffer[cur] & 0x80) cur += 2;
       else cur += 1;
 
-      if (cur >= chunkEnd) { strings.push(''); continue; }
+      if (cur >= chunkEnd) {
+        throw new AxmlParseError(`UTF-8 String #${i} byte length header extends past string pool chunk boundary.`);
+      }
 
       // Read byte length
       let byteLen = buffer[cur];
       if (byteLen & 0x80) {
-        if (cur + 1 >= chunkEnd) { strings.push(''); continue; }
+        if (cur + 1 >= chunkEnd) {
+          throw new AxmlParseError(`UTF-8 String #${i} 2-byte length header extends past string pool chunk boundary.`);
+        }
         byteLen = ((byteLen & 0x7f) << 8) | buffer[cur + 1];
         cur += 2;
       } else {
@@ -377,8 +389,7 @@ function parseStringPool(buffer: Uint8Array, offset: number, chunkSize: number):
       }
 
       if (cur + byteLen > chunkEnd) {
-        strings.push('');
-        continue;
+        throw new AxmlParseError(`UTF-8 String #${i} payload (${byteLen} bytes) extends past string pool chunk boundary.`);
       }
 
       const strBytes = buffer.subarray(cur, cur + byteLen);
@@ -386,20 +397,23 @@ function parseStringPool(buffer: Uint8Array, offset: number, chunkSize: number):
     } else {
       // UTF-16LE String decoding
       let cur = strOffset;
-      if (cur + 2 > chunkEnd) { strings.push(''); continue; }
+      if (cur + 2 > chunkEnd) {
+        throw new AxmlParseError(`UTF-16LE String #${i} header extends past string pool chunk boundary.`);
+      }
 
       let charLen = view.getUint16(cur, true);
       cur += 2;
       if (charLen & 0x8000) {
-        if (cur + 2 > chunkEnd) { strings.push(''); continue; }
+        if (cur + 2 > chunkEnd) {
+          throw new AxmlParseError(`UTF-16LE String #${i} 4-byte length header extends past string pool chunk boundary.`);
+        }
         charLen = ((charLen & 0x7fff) << 16) | view.getUint16(cur, true);
         cur += 2;
       }
 
       const byteLen = charLen * 2;
       if (cur + byteLen > chunkEnd) {
-        strings.push('');
-        continue;
+        throw new AxmlParseError(`UTF-16LE String #${i} payload (${byteLen} bytes) extends past string pool chunk boundary.`);
       }
 
       const strBytes = buffer.subarray(cur, cur + byteLen);
